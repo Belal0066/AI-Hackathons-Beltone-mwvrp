@@ -1,8 +1,4 @@
 # AI Hackathons - Beltone MWVRP Challenge
-
-Multi-Warehouse Vehicle Routing Problem (MWVRP) solver for the Beltone AI Hackathon using the Robin Logistics Environment.
-
-
 ---
 
 ## Table of Contents
