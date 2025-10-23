@@ -166,10 +166,10 @@ def bfs_shortest_path(adjacency_list: Dict, start: str, goal: str) -> Optional[L
 
 
 
-# if __name__ == '__main__':
-#     env = LogisticsEnvironment()
-#     solution = solver(env)
-#     print("Solution generated:")
-#     print(f"Number of routes: {len(solution.get('routes', []))}")
+if __name__ == '__main__':
+    env = LogisticsEnvironment()
+    solution = solver(env)
+    print("Solution generated:")
+    print(f"Number of routes: {len(solution.get('routes', []))}")
 
  
