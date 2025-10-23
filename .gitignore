@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+*.sqlite
+.DS_Store
+
+# data / artifacts
+data/
+src/__pycache__/
+*.log
+results/
+
+# notebooks checkpoints
+.ipynb_checkpoints/
+
+docs/CODE_REVIEW.md
+docs/QUICK_REFERENCE.md
+docs/SETUP_COMPLETE.md
+docs/SUBMISSION_GUIDE.md
