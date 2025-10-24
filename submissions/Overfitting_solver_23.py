@@ -109,15 +109,15 @@ class ImprovedHighFulfillmentSolver:
     # -------------------------
     def _validate_and_prune_routes(self):
         """
-        Validate each route individually.
-        If invalid:
-          - Roll back its effects on inventory and vehicle capacity.
-          - Attempt to reassign its deliveries to another suitable route.
-          - If no suitable route exists, start a new one.
+        Validate each route individually using env.validate_solution_complete on single-route solutions.
+        If a route is invalid, remove it and rollback inventory and vehicle capacity changes
+        previously applied for that route (best-effort).
+        This both helps identify the offending route(s) and ensures the final solution is valid.
         """
         if not self.routes:
             return
 
+        # iterate a copy since we may remove entries
         idx = 0
         while idx < len(self.routes):
             route = self.routes[idx]
@@ -127,44 +127,43 @@ class ImprovedHighFulfillmentSolver:
                 valid = self.env.validate_solution_complete(single_solution)
             except Exception as e:
                 LOG.warning("Per-route validation raised exception for route index %d: %s", idx, e)
+                # treat as invalid and remove
                 valid = (False, f"validation exception: {e}")
 
             is_valid = valid[0] if isinstance(valid, tuple) else valid
             if not is_valid:
                 msg = valid[1] if isinstance(valid, tuple) and len(valid) > 1 else "Unknown"
-                LOG.warning("Route at index %d invalid: %s. Rolling back and reassigning.", idx, msg)
+                LOG.warning("Route at index %d invalid: %s. Rolling back and removing route.", idx, msg)
 
-                # Extract deliveries from route before rollback
-                failed_deliveries = []
-                for step in route.get("steps", []):
-                    for d in step.get("deliveries", []):
-                        failed_deliveries.append(d)
-
-                # Rollback inventory and capacity
+                # Attempt rollback: need to infer the allocations and vehicle id used for that route.
+                # We'll best-effort:
                 self._rollback_route(idx, route)
-
-                # Remove route metadata
+                # Remove route from lists and adjust vehicle mappings
                 vid = str(route.get("vehicle_id"))
                 if vid in self.used_vehicle_ids:
                     self.used_vehicle_ids.discard(vid)
+                # Remove route index mapping if present
                 if vid in self.vehicle_route_index:
                     del self.vehicle_route_index[vid]
 
-                # Remove invalid route
+                # remove the route
                 self.routes.pop(idx)
-
-                # Try to reassign its deliveries
-                if failed_deliveries:
-                    self._reassign_failed_deliveries(failed_deliveries)
-
-                continue  # stay at same index (routes list shrank)
+                # After pop we do NOT increment idx (we want next element that shifted into this index)
+                continue
+            else:
+                LOG.debug("Route at index %d validated ok.", idx)
             idx += 1
 
     def _rollback_route(self, route_index: int, route: Dict):
         """
-        Undo inventory and capacity effects of a route (as before).
+        Attempt to undo the inventory and vehicle_remaining changes that were applied when committing this route.
+        We don't have exact allocation maps saved per-route in existing code, so we will best-effort:
+         - For pickups: sum up pickups steps and add quantities back to corresponding warehouse_inventory.
+         - For deliveries: sum deliveries and add used weight/volume back into vehicle_remaining if applicable.
+        Note: this is a best-effort approach to restore consistency so the final solution is valid.
         """
         try:
+            # 1) restore warehouse inventory from pickups in the route
             steps = route.get("steps", [])
             pickups_by_wh = defaultdict(lambda: defaultdict(int))
             for step in steps:
@@ -172,7 +171,7 @@ class ImprovedHighFulfillmentSolver:
                     wh_id = p.get("warehouse_id")
                     sku = p.get("sku_id")
                     qty = p.get("quantity", 0)
-                    if wh_id and sku and qty:
+                    if wh_id is not None and sku is not None and qty:
                         pickups_by_wh[wh_id][sku] += qty
 
             for wh_id, sku_map in pickups_by_wh.items():
@@ -180,7 +179,9 @@ class ImprovedHighFulfillmentSolver:
                 for sku_id, qty in sku_map.items():
                     inv[sku_id] = inv.get(sku_id, 0) + qty
 
+            # 2) adjust vehicle_remaining by adding back weight/volume used by deliveries on this route
             vid = str(route.get("vehicle_id"))
+            # compute delivered totals from route deliveries
             weight_released = 0.0
             volume_released = 0.0
             for step in route.get("steps", []):
@@ -192,8 +193,10 @@ class ImprovedHighFulfillmentSolver:
                         weight_released += getattr(sku, "weight", 0) * qty
                         volume_released += getattr(sku, "volume", 0) * qty
 
+            # If we already tracked remaining, add back; else set to full capacity
             vehicle_obj = self.vehicles.get(vid) or self.vehicles.get(int(vid)) if isinstance(vid, str) and vid.isdigit() else None
             if not vehicle_obj:
+                # try find by matching id types
                 for v in self.vehicles.values():
                     if str(v.id) == vid:
                         vehicle_obj = v
@@ -204,102 +207,17 @@ class ImprovedHighFulfillmentSolver:
                 cap_v = getattr(vehicle_obj, "capacity_volume", 0)
                 prev_rem = self.vehicle_remaining.get(vid)
                 if prev_rem:
+                    # add back the previously used amounts
                     new_w = min(cap_w, prev_rem["weight"] + weight_released)
                     new_v = min(cap_v, prev_rem["volume"] + volume_released)
                 else:
-                    new_w, new_v = cap_w, cap_v
+                    # route had used some capacity; restore to full (safe fallback)
+                    new_w = cap_w
+                    new_v = cap_v
                 self.vehicle_remaining[vid] = {"weight": new_w, "volume": new_v}
         except Exception as e:
-            LOG.exception("Exception during rollback of route %s: %s", route_index, e)
-    def _reassign_failed_deliveries(self, failed_deliveries: List[Dict]):
-        """
-        Try to reassign deliveries from failed routes more cost-efficiently.
-        - Group by nearest warehouse.
-        - Batch deliveries per warehouse.
-        - Prefer reusing existing vehicles/routes from that warehouse.
-        """
-        LOG.info("Reassigning %d failed deliveries (optimized).", len(failed_deliveries))
+            LOG.exception("Exception during rollback of route at index %s: %s", route_index, e)
 
-        # Group failed deliveries by nearest warehouse
-        wh_batches = defaultdict(list)
-        for d in failed_deliveries:
-            dest = d.get("node_id")
-            wh = self._find_nearest_warehouse(dest)
-            wh_batches[wh].append(d)
-
-        for wh_node, deliveries in wh_batches.items():
-            # Compute total demand of this batch
-            total_weight = sum(
-                getattr(self.skus.get(d["sku_id"]), "weight", 0) * d["quantity"]
-                for d in deliveries if self.skus.get(d["sku_id"])
-            )
-            total_volume = sum(
-                getattr(self.skus.get(d["sku_id"]), "volume", 0) * d["quantity"]
-                for d in deliveries if self.skus.get(d["sku_id"])
-            )
-
-            # 1️⃣ Try to reuse an existing route from this warehouse
-            reused = False
-            for route in self.routes:
-                if not route["steps"]:
-                    continue
-                start_node = route["steps"][0]["node_id"]
-                if start_node == wh_node:
-                    vid = str(route["vehicle_id"])
-                    rem = self.vehicle_remaining.get(vid, {"weight": 0, "volume": 0})
-                    if rem["weight"] >= total_weight and rem["volume"] >= total_volume:
-                        # Attach all deliveries in a new step near the end (before returning)
-                        route["steps"].insert(
-                            -1,
-                            {"node_id": deliveries[0]["node_id"], "pickups": [], "deliveries": deliveries},
-                        )
-                        rem["weight"] -= total_weight
-                        rem["volume"] -= total_volume
-                        reused = True
-                        LOG.info("Reused existing vehicle %s from warehouse %s for %d deliveries.",
-                                 vid, wh_node, len(deliveries))
-                        break
-
-            # 2️⃣ If no existing route fits, create a *single* new route for this warehouse
-            if not reused:
-                vid = None
-                for v_id, vehicle in self.vehicles.items():
-                    if str(v_id) not in self.used_vehicle_ids:
-                        vid = str(v_id)
-                        self.used_vehicle_ids.add(vid)
-                        cap_w = getattr(vehicle, "capacity_weight", 0)
-                        cap_v = getattr(vehicle, "capacity_volume", 0)
-                        self.vehicle_remaining[vid] = {
-                            "weight": cap_w - total_weight,
-                            "volume": cap_v - total_volume,
-                        }
-                        LOG.info("Spawned new route (batched) for warehouse %s with %d deliveries.", wh_node, len(deliveries))
-                        route = {
-                            "vehicle_id": vid,
-                            "steps": [
-                                {"node_id": wh_node, "pickups": [], "deliveries": []},
-                                {"node_id": deliveries[0]["node_id"], "pickups": [], "deliveries": deliveries},
-                                {"node_id": wh_node, "pickups": [], "deliveries": []},
-                            ],
-                        }
-                        self.routes.append(route)
-                        break
-                if not vid:
-                    LOG.warning("No available vehicle for failed deliveries batch from warehouse %s", wh_node)
-
-    def _build_route_for_failed_deliveries(self, vehicle, deliveries, dest_node_id):
-        """Construct a simple fallback route for failed deliveries."""
-        # find nearest warehouse for pickup
-        wh_node_id = self._find_nearest_warehouse(dest_node_id)
-        route = {
-            "vehicle_id": str(vehicle.id),
-            "steps": [
-                {"node_id": wh_node_id, "pickups": [], "deliveries": []},
-                {"node_id": dest_node_id, "pickups": [], "deliveries": deliveries},
-                {"node_id": wh_node_id, "pickups": [], "deliveries": []},
-            ],
-        }
-        return route
 
     # -------------------------
     # PASS 1 - Initial greedy packing (cost-aware)
