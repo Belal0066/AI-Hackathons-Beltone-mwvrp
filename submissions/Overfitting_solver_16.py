@@ -123,65 +123,6 @@ class MultiOrderLocalSearchSolver:
                     else:
                         routes.append(route)
         
-        # Phase 3: Ultra-aggressive final pass - deliver ALL remaining orders
-        # Sort remaining by smallest first (easier to fit)
-        remaining_orders = [oid for oid in orders_sorted if oid not in self.assigned_orders]
-        remaining_orders_sorted = sorted(
-            remaining_orders,
-            key=lambda oid: sum(self.orders[oid].requested_items.values())
-        )
-        
-        for oid in remaining_orders_sorted:
-            order = self.orders[oid]
-            order_demand = dict(order.requested_items)
-            
-            # Try BOTH warehouses explicitly
-            wh_id = None
-            for candidate_wh_id in self.warehouses.keys():
-                if all(self.inventory[candidate_wh_id].get(sku, 0) >= qty 
-                      for sku, qty in order_demand.items()):
-                    wh_id = candidate_wh_id
-                    break
-            
-            if not wh_id:
-                continue  # Truly no warehouse has stock
-            
-            # Calculate order weight/volume
-            order_weight = sum(
-                self.skus[sku_id].weight * qty
-                for sku_id, qty in order_demand.items()
-            )
-            order_volume = sum(
-                self.skus[sku_id].volume * qty
-                for sku_id, qty in order_demand.items()
-            )
-            
-            # Try EVERY vehicle until one works
-            for vehicle in self.vehicles:
-                if (order_weight > vehicle.capacity_weight or
-                    order_volume > vehicle.capacity_volume):
-                    continue  # Doesn't fit
-                
-                # Try to build route
-                try:
-                    route = self._build_multi_warehouse_route(
-                        vehicle, 
-                        [oid], 
-                        {oid: wh_id}
-                    )
-                    if route:
-                        routes.append(route)
-                        self.assigned_orders.add(oid)
-                        
-                        # Update inventory
-                        for sku_id, qty in order_demand.items():
-                            self.inventory[wh_id][sku_id] -= qty
-                        
-                        break  # Success! Move to next order
-                except Exception as e:
-                    # Try next vehicle
-                    continue
-        
         return {"routes": routes}
     
     def _find_nearest_warehouse_with_stock(self, demand: Dict[str, int], customer_node: int) -> Optional[str]:
